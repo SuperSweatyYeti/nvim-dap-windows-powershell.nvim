@@ -1,28 +1,71 @@
 #Requires -Version 5.1
 # dap_server.ps1 — PowerShell 5.1 DAP adapter for nvim-dap
-# Communicates over stdin/stdout using the DAP wire format.
+#
+# Communication modes:
+#   Default (-Port 0)  : stdin/stdout DAP wire format
+#   TCP     (-Port N)  : listen on loopback TCP port N for DAP;
+#                        stdout/stderr are then free for the terminal buffer
+#
+# -ReadyFile <path>    : write this file once the TCP listener is active so
+#                        the Lua side knows it is safe to connect.
+
+param(
+    [int]$Port      = 0,
+    [string]$ReadyFile = ''
+)
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
+
+# ---------------------------------------------------------------------------
+# I/O abstraction — DAP reader/writer backed by stdin/stdout or TCP stream
+# ---------------------------------------------------------------------------
+
+$script:useTcp    = $Port -gt 0
+$script:dapReader = $null
+$script:dapWriter = $null
+$script:dapLock   = [System.Object]::new()  # guards dapWriter
+$script:termLock  = [System.Object]::new()  # guards Console::Out in TCP mode
+
+if ($script:useTcp) {
+    $listener = New-Object System.Net.Sockets.TcpListener(
+        [System.Net.IPAddress]::Loopback, $Port)
+    $listener.Start()
+
+    # Signal readiness AFTER the listener is bound so the Lua side can connect
+    if ($ReadyFile -ne '') {
+        [System.IO.File]::WriteAllText($ReadyFile, 'ready')
+    }
+
+    $tcpClient = $listener.AcceptTcpClient()
+    $listener.Stop()
+
+    $netStream            = $tcpClient.GetStream()
+    $script:dapReader     = New-Object System.IO.StreamReader(
+        $netStream, [System.Text.Encoding]::UTF8)
+    $script:dapWriter     = New-Object System.IO.StreamWriter(
+        $netStream, [System.Text.Encoding]::UTF8)
+    $script:dapWriter.AutoFlush = $true
+} else {
+    $script:dapReader = [Console]::In
+    $script:dapWriter = [Console]::Out
+}
 
 # ---------------------------------------------------------------------------
 # I/O helpers — DAP wire format: "Content-Length: N\r\n\r\n<json>"
 # ---------------------------------------------------------------------------
 
 function Read-DapMessage {
-    $headerBuf = [System.Text.StringBuilder]::new()
-    $prevChar  = $null
+    $headerBuf     = [System.Text.StringBuilder]::new()
+    $prevChar      = $null
     $contentLength = $null
 
-    # Read header lines until we hit the blank line (\r\n\r\n)
     while ($true) {
-        $ch = [char][Console]::Read()
+        $ch = [char]$script:dapReader.Read()
         if ($ch -eq "`n" -and $prevChar -eq "`r") {
             $line = $headerBuf.ToString().TrimEnd("`r")
             $headerBuf.Clear() | Out-Null
-            if ($line -eq '') {
-                break   # blank line => end of headers
-            }
+            if ($line -eq '') { break }
             if ($line -match '^Content-Length:\s*(\d+)') {
                 $contentLength = [int]$Matches[1]
             }
@@ -37,16 +80,12 @@ function Read-DapMessage {
     $buf   = New-Object char[] $contentLength
     $total = 0
     while ($total -lt $contentLength) {
-        $read   = [Console]::In.Read($buf, $total, $contentLength - $total)
+        $read = $script:dapReader.Read($buf, $total, $contentLength - $total)
         if ($read -le 0) { break }
         $total += $read
     }
     $json = New-Object string (, $buf)
-    try {
-        return ConvertFrom-Json $json
-    } catch {
-        return $null
-    }
+    try { return ConvertFrom-Json $json } catch { return $null }
 }
 
 function Write-DapMessage {
@@ -54,8 +93,28 @@ function Write-DapMessage {
     $json  = ConvertTo-Json $Message -Depth 20 -Compress
     $bytes = [System.Text.Encoding]::UTF8.GetByteCount($json)
     $wire  = "Content-Length: $bytes`r`n`r`n$json"
-    [Console]::Out.Write($wire)
-    [Console]::Out.Flush()
+    [System.Threading.Monitor]::Enter($script:dapLock)
+    try {
+        $script:dapWriter.Write($wire)
+        $script:dapWriter.Flush()
+    } finally {
+        [System.Threading.Monitor]::Exit($script:dapLock)
+    }
+}
+
+# Write text directly to the terminal window.
+# In TCP mode Console::Out is the terminal buffer, not the DAP socket.
+# In stdin/stdout mode this is a no-op (stdout is the DAP socket).
+function Write-TerminalOutput {
+    param([string]$Text)
+    if (-not $script:useTcp) { return }
+    [System.Threading.Monitor]::Enter($script:termLock)
+    try {
+        [Console]::Out.Write($Text)
+        [Console]::Out.Flush()
+    } finally {
+        [System.Threading.Monitor]::Exit($script:termLock)
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -195,89 +254,84 @@ $SCOPE_GLOBAL = 1002
 # ---------------------------------------------------------------------------
 $script:runspace        = $null
 $script:ps              = $null
-$script:debuggerStop    = $null   # InvocationInfo / CallStackFrame at stop
-$script:stopEvent       = $null   # ManualResetEventSlim to block script thread
+$script:debuggerStop    = $null   # DebuggerStopEventArgs when paused at bp/step
+$script:stopEvent       = $null   # ManualResetEventSlim — blocks the script thread
 $script:resumeAction    = 'Continue'
-$script:breakpoints     = @{}     # file -> list of PSBreakpoint ids
+$script:breakpoints     = @{}     # file path -> list of PSBreakpoint ids
 $script:launched        = $false
 $script:configDone      = $false
 $script:localVarsAtStop = @{}
 $script:scriptVars      = @{}
 $script:globalVars      = @{}
-$script:callStack       = @()
 
 # ---------------------------------------------------------------------------
-# Launch the script in a separate runspace
+# Launch the target script in a separate runspace
 # ---------------------------------------------------------------------------
 function Start-DebugTarget {
     param([string]$Program, [string[]]$Args, [string]$Cwd)
 
-    $script:stopEvent = New-Object System.Threading.ManualResetEventSlim($false)
+    $script:stopEvent = [System.Threading.ManualResetEventSlim]::new($false)
 
-    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss             = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $script:runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
     $script:runspace.Open()
 
-    # Hook debugger events on the runspace's debugger
     $debugger = $script:runspace.Debugger
 
-    # DebuggerStop — fired at breakpoints / steps
+    # DebuggerStop — fired at every breakpoint and step
     Register-ObjectEvent -InputObject $debugger -EventName 'DebuggerStop' -Action {
-        $eventArgs = $Event.SourceEventArgs  # DebuggerStopEventArgs
-        $script:callStack       = @($eventArgs.InvocationInfo)
-        $script:debuggerStop    = $eventArgs
+        $eventArgs = $Event.SourceEventArgs   # DebuggerStopEventArgs
 
-        # Capture variables from the stop context
-        $cmd = [System.Management.Automation.PowerShell]::Create()
-        $cmd.Runspace = $script:runspace
+        # Snapshot variables from the paused frame
+        $capturePs = [System.Management.Automation.PowerShell]::Create()
+        $capturePs.Runspace = $script:runspace
         try {
-            $cmd.AddScript('Get-Variable -Scope 0 -ErrorAction SilentlyContinue') | Out-Null
-            $vars = $cmd.Invoke()
+            $capturePs.AddScript('Get-Variable -Scope 0 -ErrorAction SilentlyContinue') | Out-Null
             $script:localVarsAtStop = @{}
-            foreach ($v in $vars) { $script:localVarsAtStop[$v.Name] = $v.Value }
+            foreach ($v in $capturePs.Invoke()) { $script:localVarsAtStop[$v.Name] = $v.Value }
         } catch {}
         try {
-            $cmd.Commands.Clear()
-            $cmd.AddScript('Get-Variable -Scope Script -ErrorAction SilentlyContinue') | Out-Null
-            $svars = $cmd.Invoke()
+            $capturePs.Commands.Clear()
+            $capturePs.AddScript('Get-Variable -Scope Script -ErrorAction SilentlyContinue') | Out-Null
             $script:scriptVars = @{}
-            foreach ($v in $svars) { $script:scriptVars[$v.Name] = $v.Value }
+            foreach ($v in $capturePs.Invoke()) { $script:scriptVars[$v.Name] = $v.Value }
         } catch {}
         try {
-            $cmd.Commands.Clear()
-            $cmd.AddScript('Get-Variable -Scope Global -ErrorAction SilentlyContinue') | Out-Null
-            $gvars = $cmd.Invoke()
+            $capturePs.Commands.Clear()
+            $capturePs.AddScript('Get-Variable -Scope Global -ErrorAction SilentlyContinue') | Out-Null
             $script:globalVars = @{}
-            foreach ($v in $gvars) { $script:globalVars[$v.Name] = $v.Value }
+            foreach ($v in $capturePs.Invoke()) { $script:globalVars[$v.Name] = $v.Value }
         } catch {}
-        $cmd.Dispose()
+        $capturePs.Dispose()
 
+        $script:debuggerStop = $eventArgs
         Reset-VarStore
 
-        # Determine stop reason
-        $reason = 'breakpoint'
-        if ($eventArgs.Breakpoints.Count -eq 0) { $reason = 'step' }
-
+        $reason = if ($eventArgs.Breakpoints.Count -eq 0) { 'step' } else { 'breakpoint' }
         Send-Event (New-Event 'stopped' @{
             reason            = $reason
             threadId          = 1
             allThreadsStopped = $true
         })
 
-        # Block until DAP client sends continue/next/etc.
+        # Block here until the DAP client sends continue / next / stepIn / stepOut
         $script:stopEvent.Reset()
         $script:stopEvent.Wait()
 
-        # Set the resume action on the event args
-        $eventArgs.ResumeAction = [System.Management.Automation.DebuggerResumeAction]($script:resumeAction)
+        $eventArgs.ResumeAction  = [System.Management.Automation.DebuggerResumeAction]$script:resumeAction
+        $script:debuggerStop     = $null
     } | Out-Null
 
-    # BreakpointUpdated event (informational)
     Register-ObjectEvent -InputObject $debugger -EventName 'BreakpointUpdated' -Action {} | Out-Null
 
-    # Run the target script asynchronously
-    $script:ps = [System.Management.Automation.PowerShell]::Create()
+    # ---- Build the PowerShell invocation ----
+    $script:ps          = [System.Management.Automation.PowerShell]::Create()
     $script:ps.Runspace = $script:runspace
+
+    # Ensure Write-Host flows through the Information stream (PS 5+)
+    $script:ps.AddScript('$global:InformationPreference = "Continue"') | Out-Null
+    $script:ps.Invoke() | Out-Null
+    $script:ps.Commands.Clear()
 
     if ($Cwd) {
         $escapedCwd = $Cwd -replace "'", "''"
@@ -286,7 +340,6 @@ function Start-DebugTarget {
         $script:ps.Commands.Clear()
     }
 
-    # Build the script invocation — pass args if any
     $escapedProgram = $Program -replace "'", "''"
     if ($Args -and $Args.Count -gt 0) {
         $argStr = ($Args | ForEach-Object { "'$($_ -replace "'","''")'" }) -join ' '
@@ -295,43 +348,68 @@ function Start-DebugTarget {
         $script:ps.AddScript("& '$escapedProgram'") | Out-Null
     }
 
-    # Capture output streams
+    # Information stream — Write-Host in PS 5+ arrives here
     $script:ps.Streams.Information.add_DataAdded({
         param($sender, $e)
         $record = $sender[$e.Index]
-        Send-Output "$($record.MessageData)`n" 'stdout'
+        $msg = if ($record.MessageData -is [System.Management.Automation.HostInformationMessage]) {
+            $record.MessageData.Message
+        } else {
+            "$($record.MessageData)"
+        }
+        Write-TerminalOutput "$msg`n"
+        Send-Output "$msg`n" 'stdout'
     })
+
     $script:ps.Streams.Warning.add_DataAdded({
         param($sender, $e)
         $record = $sender[$e.Index]
+        Write-TerminalOutput "WARNING: $($record.Message)`n"
         Send-Output "WARNING: $($record.Message)`n" 'stderr'
     })
+
     $script:ps.Streams.Error.add_DataAdded({
         param($sender, $e)
         $record = $sender[$e.Index]
+        Write-TerminalOutput "ERROR: $($record.ToString())`n"
         Send-Output "ERROR: $($record.ToString())`n" 'stderr'
     })
+
     $script:ps.Streams.Verbose.add_DataAdded({
         param($sender, $e)
         $record = $sender[$e.Index]
+        Write-TerminalOutput "VERBOSE: $($record.Message)`n"
         Send-Output "VERBOSE: $($record.Message)`n" 'stdout'
     })
 
-    # Redirect Write-Host / standard output via InformationStream merge
-    $psInvokeSettings = New-Object System.Management.Automation.PSInvocationSettings
-    $psInvokeSettings.AddToHistory = $false
+    # Output collection captures Write-Output and plain pipeline results
+    $inputCol  = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
+    $inputCol.Complete()
+    $outputCol = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
+    $outputCol.add_DataAdded({
+        param($sender, $e)
+        $record = $sender[$e.Index]
+        $str = try {
+            if ($record -is [string]) { $record }
+            else { ($record | Out-String).TrimEnd("`r`n") }
+        } catch { '<output>' }
+        if ($str -ne '') {
+            Write-TerminalOutput "$str`n"
+            Send-Output "$str`n" 'stdout'
+        }
+    })
 
-    $callback = [System.AsyncCallback] {
+    $psSettings             = New-Object System.Management.Automation.PSInvocationSettings
+    $psSettings.AddToHistory = $false
+
+    $callback = [System.AsyncCallback]{
         param($asyncResult)
-        try {
-            $script:ps.EndInvoke($asyncResult)
-        } catch {}
+        try { $script:ps.EndInvoke($asyncResult) } catch {}
         Send-Event (New-Event 'terminated' @{})
         Send-Event (New-Event 'exited' @{ exitCode = 0 })
     }
 
-    $script:ps.BeginInvoke([System.Management.Automation.PSDataCollection[System.Management.Automation.PSObject]]$null,
-                           $psInvokeSettings, $callback, $null) | Out-Null
+    $script:ps.BeginInvoke($inputCol, $outputCol, $psSettings, $callback, $null) | Out-Null
 }
 
 # ---------------------------------------------------------------------------
@@ -569,17 +647,30 @@ function Invoke-DapServer {
                     break
                 }
                 try {
-                    $cmd = [System.Management.Automation.PowerShell]::Create()
-                    $cmd.Runspace = $script:runspace
-                    $cmd.AddScript($expression) | Out-Null
-                    $evalResult = $cmd.Invoke()
-                    $cmd.Dispose()
+                    $psOutput = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
 
-                    $resultStr = if ($evalResult -and $evalResult.Count -gt 0) {
-                        ($evalResult | Out-String).Trim()
+                    if ($null -ne $script:debuggerStop) {
+                        # Debugger is paused — use ProcessCommand to evaluate inside
+                        # the current stack frame.  This gives access to local vars.
+                        $psCmd = [System.Management.Automation.PSCommand]::new()
+                        $psCmd.AddScript($expression) | Out-Null
+                        $script:runspace.Debugger.ProcessCommand($psCmd, $psOutput) | Out-Null
                     } else {
-                        ''
+                        # Script is running — use a fresh PS instance on same runspace
+                        $ps2 = [System.Management.Automation.PowerShell]::Create()
+                        $ps2.Runspace = $script:runspace
+                        $ps2.AddScript($expression) | Out-Null
+                        foreach ($item in $ps2.Invoke()) { [void]$psOutput.Add($item) }
+                        $ps2.Dispose()
                     }
+
+                    $resultStr = if ($psOutput.Count -gt 0) {
+                        ($psOutput | ForEach-Object { "$_" }) -join "`n"
+                    } else { '' }
+
+                    # Mirror the result in the terminal window as well
+                    if ($resultStr -ne '') { Write-TerminalOutput "$resultStr`n" }
+
                     Send-Response (New-Response $seq 'evaluate' $true @{
                         result             = $resultStr
                         variablesReference = 0
