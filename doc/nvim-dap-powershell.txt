@@ -1,0 +1,233 @@
+*nvim-dap-powershell.txt*  DAP adapter for Windows PowerShell 5.1
+
+Author:   SuperSweatyYeti
+License:  MIT (see |nvim-dap-powershell-license|)
+Homepage: https://github.com/SuperSweatyYeti/nvim-dap-windows-powershell.nvim
+
+==============================================================================
+CONTENTS                                          *nvim-dap-powershell-contents*
+
+  1. Introduction .......................... |nvim-dap-powershell-intro|
+  2. Requirements .......................... |nvim-dap-powershell-requirements|
+  3. Installation .......................... |nvim-dap-powershell-install|
+  4. Configuration ......................... |nvim-dap-powershell-config|
+  5. Usage ................................. |nvim-dap-powershell-usage|
+  6. Debug Terminal ........................ |nvim-dap-powershell-terminal|
+  7. REPL .................................. |nvim-dap-powershell-repl|
+  8. Lua API ............................... |nvim-dap-powershell-api|
+  9. Supported DAP Features ................ |nvim-dap-powershell-features|
+ 10. Troubleshooting ....................... |nvim-dap-powershell-trouble|
+ 11. License ............................... |nvim-dap-powershell-license|
+
+==============================================================================
+1. INTRODUCTION                                     *nvim-dap-powershell-intro*
+
+nvim-dap-windows-powershell.nvim is a lightweight DAP adapter for Windows
+PowerShell 5.1 (`powershell.exe`).  It integrates with nvim-dap to let you
+debug `.ps1` scripts directly inside Neovim.
+
+The adapter (`adapter/dap_server.ps1`) is a self-contained PowerShell 5.1
+script that implements the Debug Adapter Protocol over a loopback TCP
+connection.  Because DAP runs over TCP, the Neovim terminal buffer that hosts
+the process is free to display live output from the debuggee.
+
+Inspired by the terminal-buffer pattern from TheLeoP/powershell.nvim.
+
+==============================================================================
+2. REQUIREMENTS                                *nvim-dap-powershell-requirements*
+
+  • Neovim ≥ 0.7
+  • nvim-dap (https://github.com/mfussenegger/nvim-dap)
+  • Windows PowerShell 5.1  (`powershell.exe` on PATH)
+  • Windows OS
+
+This plugin is specifically for Windows PowerShell 5.1.  It does NOT support
+PowerShell 7+ (`pwsh.exe`).
+
+==============================================================================
+3. INSTALLATION                                   *nvim-dap-powershell-install*
+
+lazy.nvim: >lua
+  {
+    'SuperSweatyYeti/nvim-dap-windows-powershell.nvim',
+    dependencies = { 'mfussenegger/nvim-dap' },
+    opts = {},
+  }
+<
+
+packer.nvim: >lua
+  use {
+    'SuperSweatyYeti/nvim-dap-windows-powershell.nvim',
+    requires = { 'mfussenegger/nvim-dap' },
+    config = function()
+      require('nvim-dap-powershell').setup()
+    end,
+  }
+<
+
+vim-plug: >vim
+  Plug 'mfussenegger/nvim-dap'
+  Plug 'SuperSweatyYeti/nvim-dap-windows-powershell.nvim'
+<
+
+Then call `require('nvim-dap-powershell').setup()` in your Lua config.
+
+==============================================================================
+4. CONFIGURATION                                   *nvim-dap-powershell-config*
+
+Call `setup()` with an optional options table: >lua
+
+  require('nvim-dap-powershell').setup({
+    -- Path to Windows PowerShell 5.1.
+    -- Default: 'powershell.exe' (resolved from PATH)
+    powershell_path = 'powershell.exe',
+
+    -- Vim split command for opening the debug terminal window.
+    -- Examples: 'split', 'vsplit', 'tabnew', 'belowright split'
+    terminal_split = 'split',
+
+    -- Additional or override DAP configurations merged after the built-in one.
+    configurations = {},
+  })
+<
+
+==============================================================================
+5. USAGE                                            *nvim-dap-powershell-usage*
+
+Open a `.ps1` file, toggle a breakpoint, then start debugging: >vim
+
+  :lua require('dap').toggle_breakpoint()
+  :lua require('dap').continue()
+<
+
+You will be prompted for the script path (defaults to the current file) and
+optional space-separated arguments.
+
+The adapter will:
+  1. Start `dap_server.ps1` in a hidden Neovim terminal buffer.
+  2. Connect nvim-dap over a loopback TCP socket.
+  3. Begin executing the script.  Output streams to the terminal buffer.
+
+==============================================================================
+6. DEBUG TERMINAL                                *nvim-dap-powershell-terminal*
+
+The debug terminal is a Neovim terminal buffer (`term://...`) that hosts the
+`dap_server.ps1` process.  All script output appears there in real time:
+
+  • `Write-Host` / `Write-Output` → terminal + DAP output event
+  • `Write-Warning` / `Write-Error` / `Write-Verbose` → same
+
+Toggle the terminal window:
+
+  `require('nvim-dap-powershell').toggle_debug_term()`
+
+Suggested keymap (place in `~/.config/nvim/ftplugin/ps1.lua`): >lua
+
+  vim.keymap.set('n', '<leader>dt', function()
+    require('nvim-dap-powershell').toggle_debug_term()
+  end)
+<
+
+To set a keymap *inside* the terminal buffer, listen for the User autocmd that
+fires when the terminal is created: >lua
+
+  vim.api.nvim_create_autocmd('User', {
+    pattern  = 'nvim-dap-powershell-debug_term',
+    callback = function(ev)
+      vim.keymap.set('n', '<leader>dt', function()
+        require('nvim-dap-powershell').toggle_debug_term()
+      end, { buffer = ev.data.buf })
+    end,
+  })
+<
+
+The autocmd data table contains:
+  • `buf`     — buffer number of the terminal buffer
+  • `channel` — job channel ID (can be used with `nvim_chan_send`)
+
+==============================================================================
+7. REPL                                              *nvim-dap-powershell-repl*
+
+While paused at a breakpoint, open nvim-dap's built-in REPL: >vim
+
+  :lua require('dap').repl.open()
+<
+
+Type any PowerShell expression.  The adapter evaluates it via
+`Debugger.ProcessCommand`, which runs inside the current paused stack frame and
+has full access to local variables.
+
+Example session: >
+  > $myVar
+  Hello, World!
+  > $myVar.Length
+  13
+  > Get-Date
+  Saturday, April 5, 2026 ...
+<
+
+==============================================================================
+8. LUA API                                            *nvim-dap-powershell-api*
+
+`require('nvim-dap-powershell').setup({opts})`       *nvim-dap-powershell.setup()*
+    Register the DAP adapter and configurations.  Must be called once during
+    Neovim startup before starting a debug session.
+
+`require('nvim-dap-powershell').toggle_debug_term()` *nvim-dap-powershell.toggle_debug_term()*
+    Toggle the debug terminal window open or closed.  If no session is active,
+    a warning is shown.
+
+==============================================================================
+9. SUPPORTED DAP FEATURES                         *nvim-dap-powershell-features*
+
+  ✓  initialize / configurationDone
+  ✓  launch (program, args, cwd)
+  ✓  setBreakpoints (line breakpoints)
+  ✓  threads
+  ✓  stackTrace
+  ✓  scopes (Local / Script / Global)
+  ✓  variables (with drill-down for arrays, hashtables, objects)
+  ✓  evaluate (REPL, in-frame via Debugger.ProcessCommand)
+  ✓  continue / next / stepIn / stepOut
+  ✓  output events (stdout, stderr)
+  ✓  terminated / exited events
+  ✓  disconnect
+
+  ✗  attach
+  ✗  conditional breakpoints
+  ✗  function breakpoints
+  ✗  logPoints
+  ✗  setVariable
+
+==============================================================================
+10. TROUBLESHOOTING                               *nvim-dap-powershell-trouble*
+
+Adapter does not start~
+  • Verify `powershell.exe` resolves to Windows PowerShell 5.1:
+      powershell.exe -Command "$PSVersionTable.PSVersion"
+  • Check the nvim-dap log:
+      :lua require('dap').set_log_level('DEBUG')
+    Then inspect `stdpath('cache') .. '/dap.log'`.
+
+Breakpoints never hit~
+  • Use absolute paths.  Relative paths are not resolved by the adapter.
+  • Make sure `Set-PSBreakpoint` is not being blocked by your execution policy.
+
+Debug terminal shows no output~
+  • Open it with `toggle_debug_term()`.
+  • Ensure `$InformationPreference` is not set to `SilentlyContinue` globally.
+
+"Server did not signal ready" error~
+  • PowerShell startup is slow on some systems.  The poller retries 60 times
+    at 300 ms intervals (18 s total).  If your machine needs more time, file
+    an issue.
+
+==============================================================================
+11. LICENSE                                        *nvim-dap-powershell-license*
+
+MIT License.  Copyright (c) 2026 SuperSweatyYeti.
+
+Full text: https://github.com/SuperSweatyYeti/nvim-dap-windows-powershell.nvim/blob/main/LICENSE
+
+==============================================================================
+vim:tw=78:ts=2:ft=help:norl:
