@@ -17,6 +17,14 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Continue'
 
+# Force BOM-less UTF-8 on all output streams to prevent DAP header corruption.
+# In .NET Framework (PowerShell 5.1) [System.Text.Encoding]::UTF8 includes a
+# BOM preamble; we must create the encoding explicitly with $false to suppress it.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8NoBom
+[Console]::InputEncoding  = $utf8NoBom
+$OutputEncoding           = $utf8NoBom
+
 # ---------------------------------------------------------------------------
 # I/O abstraction — DAP reader/writer backed by stdin/stdout or TCP stream
 # ---------------------------------------------------------------------------
@@ -42,13 +50,15 @@ if ($script:useTcp) {
 
     $netStream            = $tcpClient.GetStream()
     $script:dapReader     = New-Object System.IO.StreamReader(
-        $netStream, [System.Text.Encoding]::UTF8)
+        $netStream, $utf8NoBom)
     $script:dapWriter     = New-Object System.IO.StreamWriter(
-        $netStream, [System.Text.Encoding]::UTF8)
+        $netStream, $utf8NoBom)
     $script:dapWriter.AutoFlush = $true
 } else {
     $script:dapReader = [Console]::In
-    $script:dapWriter = [Console]::Out
+    $script:dapWriter = New-Object System.IO.StreamWriter(
+        [Console]::OpenStandardOutput(), $utf8NoBom)
+    $script:dapWriter.AutoFlush = $true
 }
 
 # ---------------------------------------------------------------------------
