@@ -550,7 +550,7 @@ function Invoke-DapServer {
                 }
 
                 $verified = Set-DapBreakpoints -Source $source -BreakpointLines $bpLines
-                Send-Response (New-Response $seq 'setBreakpoints' $true @{ breakpoints = $verified })
+                Send-Response (New-Response $seq 'setBreakpoints' $true @{ breakpoints = @($verified) })
             }
 
             'threads' {
@@ -608,7 +608,7 @@ function Invoke-DapServer {
                 }
 
                 Send-Response (New-Response $seq 'stackTrace' $true @{
-                    stackFrames = $frames
+                    stackFrames = @($frames)
                     totalFrames = $frames.Count
                 })
             }
@@ -647,7 +647,7 @@ function Invoke-DapServer {
                     $results = @()
                 }
 
-                Send-Response (New-Response $seq 'variables' $true @{ variables = $results })
+                Send-Response (New-Response $seq 'variables' $true @{ variables = @($results) })
             }
 
             'evaluate' {
