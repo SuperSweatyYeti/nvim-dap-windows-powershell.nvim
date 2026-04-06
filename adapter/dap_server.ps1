@@ -286,6 +286,7 @@ function Start-DebugTarget {
     $iss             = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $script:runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
     $script:runspace.Open()
+    $script:runspace.Debugger.SetDebugMode([System.Management.Automation.DebugModes]::LocalScript)
 
     $debugger = $script:runspace.Debugger
 
