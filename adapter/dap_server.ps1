@@ -262,23 +262,24 @@ $SCOPE_GLOBAL = 1002
 # ---------------------------------------------------------------------------
 # Debugger state
 # ---------------------------------------------------------------------------
-$script:runspace        = $null
-$script:ps              = $null
-$script:debuggerStop    = $null   # DebuggerStopEventArgs when paused at bp/step
-$script:stopEvent       = $null   # ManualResetEventSlim — blocks the script thread
-$script:resumeAction    = 'Continue'
-$script:breakpoints     = @{}     # file path -> list of PSBreakpoint ids
-$script:launched        = $false
-$script:configDone      = $false
-$script:localVarsAtStop = @{}
-$script:scriptVars      = @{}
-$script:globalVars      = @{}
+$script:runspace            = $null
+$script:ps                  = $null
+$script:debuggerStop        = $null   # DebuggerStopEventArgs when paused at bp/step
+$script:stopEvent           = $null   # ManualResetEventSlim — blocks the script thread
+$script:resumeAction        = 'Continue'
+$script:breakpoints         = @{}     # file path -> list of PSBreakpoint ids
+$script:pendingBreakpoints  = @()     # breakpoint requests queued before runspace exists
+$script:launched            = $false
+$script:configDone          = $false
+$script:localVarsAtStop     = @{}
+$script:scriptVars          = @{}
+$script:globalVars          = @{}
 
 # ---------------------------------------------------------------------------
 # Launch the target script in a separate runspace
 # ---------------------------------------------------------------------------
 function Start-DebugTarget {
-    param([string]$Program, [string[]]$Args, [string]$Cwd)
+    param([string]$Program, [string[]]$Args, [string]$Cwd, $PendingBreakpoints = @())
 
     $script:stopEvent = [System.Threading.ManualResetEventSlim]::new($false)
 
@@ -419,6 +420,12 @@ function Start-DebugTarget {
         Send-Event (New-Event 'exited' @{ exitCode = 0 })
     }
 
+    # Apply any breakpoints that arrived before the runspace was created,
+    # so they are set BEFORE the target script begins executing.
+    foreach ($pending in $PendingBreakpoints) {
+        Set-DapBreakpoints -Source $pending.source -BreakpointLines $pending.lines | Out-Null
+    }
+
     $script:ps.BeginInvoke($inputCol, $outputCol, $psSettings, $callback, $null) | Out-Null
 }
 
@@ -521,7 +528,8 @@ function Invoke-DapServer {
                 $cwd        = if ($args -and $args.PSObject.Properties['cwd'])     { $args.cwd }        else { $null }
 
                 try {
-                    Start-DebugTarget -Program $program -Args $launchArgs -Cwd $cwd
+                    Start-DebugTarget -Program $program -Args $launchArgs -Cwd $cwd -PendingBreakpoints $script:pendingBreakpoints
+                    $script:pendingBreakpoints = @()
                     $script:launched = $true
                     Send-Response (New-Response $seq 'launch' $true)
                 } catch {
@@ -535,17 +543,20 @@ function Invoke-DapServer {
             }
 
             'setBreakpoints' {
-                if (-not $script:runspace) {
-                    # Runspace not ready yet — queue breakpoints to set after launch
-                    Send-Response (New-Response $seq 'setBreakpoints' $true @{ breakpoints = @() })
-                    break
-                }
-                $source = if ($args -and $args.PSObject.Properties['source'] -and
-                              $args.source.PSObject.Properties['path']) { $args.source.path } else { $null }
+                $source  = if ($args -and $args.PSObject.Properties['source'] -and
+                               $args.source.PSObject.Properties['path']) { $args.source.path } else { $null }
                 $bpLines = if ($args -and $args.PSObject.Properties['breakpoints']) { @($args.breakpoints) } else { @() }
 
                 if (-not $source) {
                     Send-ErrorResponse $seq 'setBreakpoints' "No source path provided"
+                    break
+                }
+
+                if (-not $script:runspace) {
+                    # Runspace not ready yet — queue for after launch and respond with unverified
+                    $script:pendingBreakpoints += @{ source = $source; lines = $bpLines }
+                    $unverified = @($bpLines | ForEach-Object { @{ verified = $false; line = $_.line } })
+                    Send-Response (New-Response $seq 'setBreakpoints' $true @{ breakpoints = $unverified })
                     break
                 }
 
