@@ -290,9 +290,13 @@ function Start-DebugTarget {
 
     $debugger = $script:runspace.Debugger
 
-    # DebuggerStop — fired at every breakpoint and step
-    Register-ObjectEvent -InputObject $debugger -EventName 'DebuggerStop' -Action {
-        $eventArgs = $Event.SourceEventArgs   # DebuggerStopEventArgs
+    # DebuggerStop — fired at every breakpoint and step.
+    # Use add_DebuggerStop() (direct .NET event subscription) so the handler runs
+    # synchronously on the debuggee's thread. Register-ObjectEvent would queue the
+    # event to a different runspace/thread, meaning the script thread never actually
+    # blocks and $eventArgs.ResumeAction is never read by the debugger.
+    $script:debuggerStopHandler = {
+        param($sender, $eventArgs)
 
         # Snapshot variables from the paused frame
         $capturePs = [System.Management.Automation.PowerShell]::Create()
@@ -326,15 +330,19 @@ function Start-DebugTarget {
             allThreadsStopped = $true
         })
 
-        # Block here until the DAP client sends continue / next / stepIn / stepOut
+        # Block the debuggee's thread until the DAP client sends continue / next / stepIn / stepOut
         $script:stopEvent.Reset()
         $script:stopEvent.Wait()
 
         $eventArgs.ResumeAction  = [System.Management.Automation.DebuggerResumeAction]$script:resumeAction
         $script:debuggerStop     = $null
-    } | Out-Null
+    }
+    $debugger.add_DebuggerStop($script:debuggerStopHandler)
 
-    Register-ObjectEvent -InputObject $debugger -EventName 'BreakpointUpdated' -Action {} | Out-Null
+    # Register an empty BreakpointUpdated handler so the event is acknowledged.
+    # Stored in a script variable so it can be unregistered on disconnect.
+    $script:breakpointUpdatedHandler = {}
+    $debugger.add_BreakpointUpdated($script:breakpointUpdatedHandler)
 
     # ---- Build the PowerShell invocation ----
     $script:ps          = [System.Management.Automation.PowerShell]::Create()
@@ -737,6 +745,9 @@ function Invoke-DapServer {
                     try { $script:ps.Stop() } catch {}
                 }
                 if ($script:runspace) {
+                    # Remove direct event handlers before closing the runspace
+                    try { $script:runspace.Debugger.remove_DebuggerStop($script:debuggerStopHandler) } catch {}
+                    try { $script:runspace.Debugger.remove_BreakpointUpdated($script:breakpointUpdatedHandler) } catch {}
                     try { $script:runspace.Close() } catch {}
                     try { $script:runspace.Dispose() } catch {}
                 }
