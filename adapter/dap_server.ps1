@@ -334,7 +334,25 @@ function Start-DebugTarget {
         $script:stopEvent.Reset()
         $script:stopEvent.Wait()
 
-        $eventArgs.ResumeAction  = [System.Management.Automation.DebuggerResumeAction]$script:resumeAction
+        # Use ProcessCommand() to properly resume the debugger in PowerShell 5.1.
+        # Directly setting $eventArgs.ResumeAction is not sufficient when using
+        # BeginInvoke() — the debugger drops into an interactive prompt and the
+        # runspace becomes corrupted. ProcessCommand() is the correct mechanism,
+        # as used by PowerShell Editor Services (PSES).
+        $debuggerCommandMap = @{
+            'Continue' = 'c'
+            'StepOver' = 'v'
+            'StepInto' = 's'
+            'StepOut'  = 'o'
+        }
+        $dbgCmd = $debuggerCommandMap[$script:resumeAction]
+        if (-not $dbgCmd) { $dbgCmd = 'c' }  # fallback to continue
+
+        $psCmd = [System.Management.Automation.PSCommand]::new()
+        $psCmd.AddScript($dbgCmd) | Out-Null
+        $dbgOutput = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
+        $dbgResult = $sender.ProcessCommand($psCmd, $dbgOutput)
+        $eventArgs.ResumeAction  = $dbgResult.ResumeAction
         $script:debuggerStop     = $null
     }
     $debugger.add_DebuggerStop($script:debuggerStopHandler)
